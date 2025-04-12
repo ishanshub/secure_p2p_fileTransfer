@@ -1,9 +1,13 @@
+// gcc peer.c -o peer -lssl -lcrypto -lpthread
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 #include <pthread.h>
 #include <arpa/inet.h>
+#include <openssl/dh.h>
+#include <openssl/bn.h>
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
 
@@ -58,9 +62,73 @@ void decrypt(unsigned char *ciphertext, int ciphertext_len, unsigned char *key,
     EVP_CIPHER_CTX_free(ctx);
 }
 
-void generate_hmac(unsigned char *data, int data_len, unsigned char *hmac_output) {
+void generate_hmac(unsigned char *data, int data_len, unsigned char *key, unsigned char *hmac_output) {
     unsigned int len;
-    HMAC(EVP_sha256(), SECRET_KEY, strlen(SECRET_KEY), data, data_len, hmac_output, &len);
+    HMAC(EVP_sha256(), key, 16, data, data_len, hmac_output, &len);
+}
+
+
+void do_diffie_hellman(int sock, unsigned char* derived_key) {
+    DH* dh = DH_get_2048_256();  // Built-in safe prime group
+
+    // Print DH parameters
+    const BIGNUM *p, *q, *g;
+    DH_get0_pqg(dh, &p, &q, &g);
+
+    printf("\n[DEBUG] DH Parameters:\n");
+    printf("p: ");
+    BN_print_fp(stdout, p);
+    printf("\n");
+
+    if (q) {
+        printf("q: ");
+        BN_print_fp(stdout, q);
+        printf("\n");
+    } else {
+        printf("q: (none)\n");
+    }
+
+    printf("g: ");
+    BN_print_fp(stdout, g);
+    printf("\n");
+
+    DH_generate_key(dh);
+    const BIGNUM* pub_key = NULL;
+    DH_get0_key(dh, &pub_key, NULL);
+
+    int pub_key_len = BN_num_bytes(pub_key);
+    unsigned char* pub_key_bin = malloc(pub_key_len);
+    BN_bn2bin(pub_key, pub_key_bin);
+
+    // Send my public key
+    send(sock, &pub_key_len, sizeof(int), 0);
+    send(sock, pub_key_bin, pub_key_len, 0);
+
+    // Receive peer's public key
+    int peer_pub_key_len;
+    recv(sock, &peer_pub_key_len, sizeof(int), 0);
+    unsigned char* peer_pub_key_bin = malloc(peer_pub_key_len);
+    recv(sock, peer_pub_key_bin, peer_pub_key_len, 0);
+
+    BIGNUM* peer_pub_key = BN_bin2bn(peer_pub_key_bin, peer_pub_key_len, NULL);
+
+    unsigned char shared_secret[256];
+    int secret_size = DH_compute_key(shared_secret, peer_pub_key, dh);
+
+    // 🔥 Print the derived shared secret
+    printf("[DEBUG] Derived Shared Secret: ");
+    for (int i = 0; i < secret_size; i++) printf("%02x", shared_secret[i]);
+    printf("\n\n");
+
+    memcpy(derived_key, shared_secret, 16);  // AES-128
+
+    free(pub_key_bin);
+    free(peer_pub_key_bin);
+    BN_free(peer_pub_key);
+    DH_free(dh);
+
+    // ✨ Log security property
+    printf("[SECURITY] Perfect Forward Secrecy (PFS) achieved: Fresh DH key for this connection.\n\n");
 }
 
 void* server_thread(void* arg) {
@@ -76,6 +144,9 @@ void* server_thread(void* arg) {
 
     while (1) {
         int client_sock = accept(server_sock, NULL, NULL);
+
+        unsigned char derived_key[16];
+        do_diffie_hellman(client_sock, derived_key);
 
         int fname_len;
         recv(client_sock, &fname_len, sizeof(int), 0);
@@ -93,7 +164,7 @@ void* server_thread(void* arg) {
         recv(client_sock, received_hmac, 32, 0);
 
         unsigned char computed_hmac[32];
-        generate_hmac(ciphertext, ciphertext_len, computed_hmac);
+        generate_hmac(ciphertext, ciphertext_len, derived_key, computed_hmac);
 
         if (memcmp(received_hmac, computed_hmac, 32) != 0) {
             printf("[!] HMAC verification failed!\n");
@@ -104,7 +175,7 @@ void* server_thread(void* arg) {
 
         unsigned char* plaintext = malloc(ciphertext_len);
         int plaintext_len;
-        decrypt(ciphertext, ciphertext_len, (unsigned char*)SECRET_KEY, plaintext, &plaintext_len);
+        decrypt(ciphertext, ciphertext_len, derived_key, plaintext, &plaintext_len);
 
         FILE *fp = fopen(filename, "wb");
         fwrite(plaintext, 1, plaintext_len, fp);
@@ -130,9 +201,9 @@ void* broadcast_thread(void* arg) {
     broadcast_addr.sin_addr.s_addr = inet_addr("255.255.255.255");
 
     char message[100];
-    sprintf(message, "%s %s %d", my_name, my_ip, my_port);
 
     while (1) {
+        sprintf(message, "%s %s %d", my_name, my_ip, my_port);
         sendto(sock, message, strlen(message), 0, (struct sockaddr*)&broadcast_addr, sizeof(broadcast_addr));
         sleep(BROADCAST_INTERVAL);
     }
@@ -140,6 +211,10 @@ void* broadcast_thread(void* arg) {
 
 void* listen_broadcast_thread(void* arg) {
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
+
+    int optval = 1;
+    setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &optval, sizeof(optval));
+
     struct sockaddr_in recv_addr;
     recv_addr.sin_family = AF_INET;
     recv_addr.sin_port = htons(BROADCAST_PORT);
@@ -176,6 +251,7 @@ void* listen_broadcast_thread(void* arg) {
         }
     }
 }
+
 
 void refresh_peers() {
     printf("\n--- Available Peers ---\n");
@@ -217,13 +293,6 @@ void send_file() {
     fread(file_data, 1, file_size, fp);
     fclose(fp);
 
-    unsigned char ciphertext[BUFFER_SIZE];
-    int ciphertext_len;
-    encrypt(file_data, file_size, (unsigned char*)SECRET_KEY, ciphertext, &ciphertext_len);
-
-    unsigned char hmac[32];
-    generate_hmac(ciphertext, ciphertext_len, hmac);
-
     int sock = socket(AF_INET, SOCK_STREAM, 0);
     struct sockaddr_in peer_addr;
     peer_addr.sin_family = AF_INET;
@@ -236,6 +305,20 @@ void send_file() {
         return;
     }
 
+    // Diffie-Hellman key exchange
+    unsigned char derived_key[16];
+    do_diffie_hellman(sock, derived_key);
+
+    // Encrypt file with derived key
+    unsigned char ciphertext[BUFFER_SIZE];
+    int ciphertext_len;
+    encrypt(file_data, file_size, derived_key, ciphertext, &ciphertext_len);
+
+    // Generate HMAC with derived key
+    unsigned char hmac[32];
+    generate_hmac(ciphertext, ciphertext_len, derived_key, hmac);
+
+    // Send encrypted file and hmac
     int fname_len = strlen(filepath);
     send(sock, &fname_len, sizeof(int), 0);
     send(sock, filepath, fname_len, 0);
